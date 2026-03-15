@@ -1,6 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.UI;
+using UnityEngine.Events;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.HighDefinition;
 using UnityEngine.SceneManagement;
@@ -11,21 +11,29 @@ public class CanvasManager : MonoBehaviour
 
     private Dictionary<string, GameObject> canvasDictionary = new Dictionary<string, GameObject>();
     private GameObject currentActiveCanvas = null;
+    public GameObject CurrentActiveCanvas => currentActiveCanvas;
 
-    [Header("Player Kontrol Referanslarý")]
-    private MovementController playerMovement;
-    private MouseLook mouseLook;
-    private InspectionHandler inspectorHandler;
-    private GameObject crosshairUI;
+    [Header("Scene Settings")]
+    [Tooltip("Bu sahnedeyken oyuncu kontrolleri aranmaz ve menÃ¼ mantÄ±ÄŸÄ± Ã§alÄ±ÅŸÄ±r.")]
+    public string mainMenuSceneName = "MainMenu";
 
-    [Header("HDRP Blur Kontrolü")]
+    [Header("Canvas Exceptions")]
+    [Tooltip("Envanter gibi menÃ¼ler aÃ§Ä±ldÄ±ÄŸÄ±nda kapanmamasÄ±nÄ± istediÄŸiniz canvas isimleri (Ã–rn: DiaryCanvas, HUD)")]
+    public List<string> persistentCanvases = new List<string>();
+    
+    [Tooltip("SÃ¼rekli Ã§alÄ±ÅŸmasÄ± gereken (Update'i durmamalÄ±) ama gÃ¶rÃ¼nmez olabilen Canvas'lar (Ã–rn: WeaponWheel). Obje kapanmaz, CanvasGroup sÄ±fÄ±rlanÄ±r.")]
+    public List<string> canvasGroupOnlyCanvases = new List<string>();
+
+    [Header("Events")]
+    [Tooltip("UI aÃ§Ä±ldÄ±ÄŸÄ±nda/kapandÄ±ÄŸÄ±nda tetiklenir. True = Oyuncu hareket edebilir, False = UI aÃ§Ä±k, oyuncu durmalÄ±.")]
+    public UnityEvent<bool> onPlayerControlToggled;
+
+    [Header("HDRP Blur KontrolÃ¼")]
     private Volume globalVolume;
     private DepthOfField depthOfField;
     private bool isBlurActive = false;
 
-    public GameObject CurrentActiveCanvas => currentActiveCanvas;
-
-    #region Singleton ve Sahne Yönetimi
+    #region Singleton ve Sahne YÃ¶netimi
 
     private void Awake()
     {
@@ -57,7 +65,7 @@ public class CanvasManager : MonoBehaviour
 
     void OnSceneLoaded(Scene scene, LoadSceneMode mode)
     {
-        if (scene.name == "MainMenu")
+        if (scene.name == mainMenuSceneName)
         {
             SetPlayerState(false);
             InitializeSceneReferences();
@@ -71,28 +79,17 @@ public class CanvasManager : MonoBehaviour
         canvasDictionary.Clear();
         currentActiveCanvas = null;
 
-        playerMovement = FindObjectOfType<MovementController>();
-        mouseLook = FindObjectOfType<MouseLook>();
-        inspectorHandler = FindObjectOfType<InspectionHandler>();
-
-        Transform crosshairTransform = transform.Find("Crosshair");
-        if (crosshairTransform == null) crosshairUI = GameObject.Find("Crosshair");
-        else crosshairUI = crosshairTransform.gameObject;
-
         globalVolume = FindObjectOfType<Volume>();
         depthOfField = null;
 
-        if (globalVolume != null)
+        if (globalVolume != null && globalVolume.profile.TryGet<DepthOfField>(out DepthOfField dof))
         {
-            if (globalVolume.profile.TryGet<DepthOfField>(out DepthOfField dof))
-            {
-                depthOfField = dof;
-                depthOfField.active = false;
-                isBlurActive = false;
-            }
+            depthOfField = dof;
+            depthOfField.active = false;
+            isBlurActive = false;
         }
 
-        if (SceneManager.GetActiveScene().name != "MainMenu")
+        if (SceneManager.GetActiveScene().name != mainMenuSceneName)
         {
             SetPlayerState(true);
         }
@@ -100,7 +97,7 @@ public class CanvasManager : MonoBehaviour
 
     #endregion
 
-    #region Canvas Kontrol Metotlarý
+    #region Canvas Kontrol MetotlarÄ±
 
     public void RegisterCanvas(string canvasName, GameObject canvasObject)
     {
@@ -109,31 +106,22 @@ public class CanvasManager : MonoBehaviour
         if (!canvasDictionary.ContainsKey(canvasName))
         {
             canvasDictionary.Add(canvasName, canvasObject);
-
-            // ÖNEMLÝ: Elle SetActive(false) yapma!
-            // Yeni yazdýðýmýz akýllý fonksiyonu kullan.
-            // O, WeaponWheel ise görünmez yapar, deðilse kapatýr.
             SetCanvasVisibility(canvasObject, false);
         }
     }
 
     public void OpenCanvas(string canvasName)
     {
-        if (PauseManager.GameIsPaused) return;
+        // Zaman durmuÅŸsa (Pause menÃ¼sÃ¼ vb.) iÅŸlemi iptal et
+        if (Time.timeScale == 0f) return;
 
-        // WeaponWheel hariç diðerlerini kapat (Envanter açýlýrken diðerleri kapansýn istiyorsan)
-        if (currentActiveCanvas != null && currentActiveCanvas.activeInHierarchy && currentActiveCanvas.name != "DiaryCanvas")
+        // Ä°stisna listesinde DEÄžÄ°LSE mevcut canvas'Ä± kapat
+        if (currentActiveCanvas != null && currentActiveCanvas.activeInHierarchy && !persistentCanvases.Contains(currentActiveCanvas.name))
         {
             CloseCanvas(currentActiveCanvas.name);
         }
 
         SetPlayerState(false);
-
-        if (inspectorHandler != null && inspectorHandler.IsInspecting)
-        {
-            inspectorHandler.ExitInspectionModeForced();
-        }
-
         SetScreenBlur(true);
 
         if (canvasDictionary.TryGetValue(canvasName, out GameObject canvasToOpen))
@@ -146,15 +134,13 @@ public class CanvasManager : MonoBehaviour
                 return;
             }
 
-            // Görünür yap
             SetCanvasVisibility(canvasToOpen, true);
-
             currentActiveCanvas = canvasToOpen;
             Canvas.ForceUpdateCanvases();
         }
         else
         {
-            Debug.LogWarning($"CanvasManager: '{canvasName}' bulunamadý!");
+            Debug.LogWarning($"CanvasManager: '{canvasName}' bulunamadÄ±!");
             SetPlayerState(true);
             SetScreenBlur(false);
         }
@@ -162,13 +148,12 @@ public class CanvasManager : MonoBehaviour
 
     public bool IsAnyCanvasOpen()
     {
-        // WeaponWheel özel kontrolü: Obje aktif olabilir ama Canvas disabled ise "kapalý" sayýlýr.
         if (currentActiveCanvas != null)
         {
-            if (currentActiveCanvas.name == "WeaponWheelCanvas")
+            if (canvasGroupOnlyCanvases.Contains(currentActiveCanvas.name))
             {
-                Canvas c = currentActiveCanvas.GetComponent<Canvas>();
-                return c != null && c.enabled;
+                CanvasGroup group = currentActiveCanvas.GetComponent<CanvasGroup>();
+                return group != null && group.alpha > 0;
             }
             return currentActiveCanvas.activeInHierarchy;
         }
@@ -182,20 +167,14 @@ public class CanvasManager : MonoBehaviour
         {
             if (canvas == null) continue;
 
-            // WeaponWheelCanvas veya aktif olan herhangi bir canvas
-            if (canvas.activeInHierarchy)
+            if (canvas.activeInHierarchy && !persistentCanvases.Contains(canvas.name))
             {
-                // DiaryCanvas istisnasý (eðer kalacaksa)
-                if (canvas.name != "DiaryCanvas")
-                {
-                    canvasesToClose.Add(canvas);
-                }
+                canvasesToClose.Add(canvas);
             }
         }
 
         foreach (var canvas in canvasesToClose)
         {
-            // Özel kapatma fonksiyonumuzu kullan
             SetCanvasVisibility(canvas, false);
         }
 
@@ -214,15 +193,14 @@ public class CanvasManager : MonoBehaviour
                 return;
             }
 
-            // Özel kapatma fonksiyonu
             SetCanvasVisibility(canvas, false);
 
             if (currentActiveCanvas == canvas)
             {
                 currentActiveCanvas = null;
                 SetScreenBlur(false);
-
-                if (!PauseManager.GameIsPaused)
+                
+                if (Time.timeScale > 0f) // Oyun duraklatÄ±lmamÄ±ÅŸsa
                 {
                     SetPlayerState(true);
                 }
@@ -230,69 +208,39 @@ public class CanvasManager : MonoBehaviour
         }
     }
 
-    // --- SÝHÝRLÝ FONKSÝYON ---
-    // Bu fonksiyon, WeaponWheelCanvas ise Objesini kapatmaz, sadece çizimini (Canvas) kapatýr.
-    // Böylece script çalýþmaya devam eder.
-    // --- KESÝN ÇÖZÜM FONKSÝYONU ---
     private void SetCanvasVisibility(GameObject canvasObj, bool isVisible)
     {
-        // Kontrol: Bu obje Weapon Wheel mi? (Ýsmi veya içindeki scriptten anlarýz)
-        // Senin hiyerarþinde ismi "WeaponWheel" olduðu için bu kontrolü ekledim.
-        bool isWeaponWheel = canvasObj.name == "WeaponWheelCanvas" || canvasObj.name == "WeaponWheel";
+        bool useCanvasGroup = canvasGroupOnlyCanvases.Contains(canvasObj.name);
 
-        if (isWeaponWheel)
+        if (useCanvasGroup)
         {
-            // 1. Objeyi ASLA kapatma, hep açýk kalsýn ki script çalýþsýn
             if (!canvasObj.activeSelf) canvasObj.SetActive(true);
 
-            // 2. Görünürlüðü CanvasGroup ile yönet
             CanvasGroup group = canvasObj.GetComponent<CanvasGroup>();
-
-            // Eðer CanvasGroup eklemeyi unuttuysan kod otomatik eklesin:
             if (group == null) group = canvasObj.AddComponent<CanvasGroup>();
 
-            if (isVisible)
-            {
-                group.alpha = 1f; // Tam görünür
-                group.interactable = true; // Týklanabilir
-                group.blocksRaycasts = true; // Iþýnlarý tutar
-            }
-            else
-            {
-                group.alpha = 0f; // Tamamen þeffaf (Görünmez)
-                group.interactable = false; // Týklanamaz
-                group.blocksRaycasts = false; // Arkasýndaki her þeye týklanabilir
-            }
+            group.alpha = isVisible ? 1f : 0f;
+            group.interactable = isVisible;
+            group.blocksRaycasts = isVisible;
         }
         else
         {
-            // Diðer tüm normal menüler (Pause, Notlar vb.) eskisi gibi açýlýp kapansýn
             canvasObj.SetActive(isVisible);
         }
     }
 
     #endregion
 
-    #region Yardýmcý Metotlar
+    #region YardÄ±mcÄ± Metotlar
 
     public void SetPlayerState(bool isActive)
     {
-        if (PauseManager.GameIsPaused && isActive) return;
-
-        if (playerMovement != null)
-            playerMovement.enabled = isActive;
-
-        if (mouseLook != null)
-            mouseLook.enabled = isActive;
-
-        if (inspectorHandler != null)
-            inspectorHandler.enabled = isActive;
-
-        if (crosshairUI != null)
-            crosshairUI.SetActive(isActive);
-
+        // Fareyi kilitle / serbest bÄ±rak
         Cursor.lockState = isActive ? CursorLockMode.Locked : CursorLockMode.None;
         Cursor.visible = !isActive;
+
+        // DiÄŸer scriptlere (Hareket, Kamera vb.) haber ver
+        onPlayerControlToggled?.Invoke(isActive);
     }
 
     private void SetScreenBlur(bool shouldBeActive)
@@ -303,8 +251,6 @@ public class CanvasManager : MonoBehaviour
         depthOfField.active = shouldBeActive;
         isBlurActive = shouldBeActive;
     }
-
-
 
     #endregion
 }
